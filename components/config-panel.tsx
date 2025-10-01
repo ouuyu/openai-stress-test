@@ -8,6 +8,7 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Loader2, Play, Square } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
+import { getRandomTopic } from "@/lib/article-topics"
 
 interface ConfigPanelProps {
   isRunning: boolean
@@ -26,6 +27,8 @@ export function ConfigPanel({ isRunning, setIsRunning, setMetrics }: ConfigPanel
   const [concurrency, setConcurrency] = useState("5")
   const [loadingModels, setLoadingModels] = useState(false)
   const { toast } = useToast()
+
+  const [abortController, setAbortController] = useState<AbortController | null>(null)
 
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY)
@@ -94,66 +97,172 @@ export function ConfigPanel({ isRunning, setIsRunning, setMetrics }: ConfigPanel
       return
     }
 
+    const controller = new AbortController()
+    setAbortController(controller)
     setIsRunning(true)
-    setMetrics({
-      total: Number.parseInt(requestCount),
+
+    const totalRequests = Number.parseInt(requestCount)
+    const maxConcurrency = Number.parseInt(concurrency)
+    const startTime = Date.now()
+
+    const metricsState = {
+      total: totalRequests,
       completed: 0,
       successful: 0,
       failed: 0,
       avgResponseTime: 0,
       rpm: 0,
-      startTime: Date.now(),
-      requests: [],
-    })
+      startTime,
+      requests: [] as any[],
+    }
 
-    try {
-      const response = await fetch("/api/stress-test", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          baseUrl,
-          apiKey,
-          model: selectedModel,
-          requestCount: Number.parseInt(requestCount),
-          concurrency: Number.parseInt(concurrency),
-        }),
-      })
+    setMetrics(metricsState)
 
-      const reader = response.body?.getReader()
-      const decoder = new TextDecoder()
+    const makeRequest = async (index: number) => {
+      if (controller.signal.aborted) return
 
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
+      const requestStartTime = Date.now()
+      const topic = getRandomTopic()
 
-          const chunk = decoder.decode(value)
-          const lines = chunk.split("\n").filter((line) => line.trim())
+      try {
+        const response = await fetch(`${baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: selectedModel,
+            messages: [
+              {
+                role: "user",
+                content: `请写一篇关于以下主题的深度文章（1000-1500字）：\n\n${topic}\n\n要求：\n1. 内容详实，观点明确\n2. 结构清晰，包含引言、主体和结论\n3. 使用具体案例和数据支持论点\n4. 语言流畅，逻辑严密`,
+              },
+            ],
+            max_tokens: 2000,
+            stream: true,
+          }),
+          signal: controller.signal,
+        })
 
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              const data = JSON.parse(line.slice(6))
-              setMetrics((prev: any) => ({
-                ...prev,
-                ...data,
-              }))
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`)
+        }
+
+        const reader = response.body?.getReader()
+        const decoder = new TextDecoder()
+        let fullContent = ""
+
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+
+            const chunk = decoder.decode(value)
+            const lines = chunk.split("\n").filter((line) => line.trim() !== "")
+
+            for (const line of lines) {
+              if (line.startsWith("data: ")) {
+                const data = line.slice(6)
+                if (data === "[DONE]") continue
+
+                try {
+                  const parsed = JSON.parse(data)
+                  const content = parsed.choices?.[0]?.delta?.content
+                  if (content) {
+                    fullContent += content
+                  }
+                } catch (e) {
+                  // Ignore parse errors
+                }
+              }
             }
           }
         }
+
+        const responseTime = Date.now() - requestStartTime
+
+        metricsState.completed++
+        metricsState.successful++
+        metricsState.requests.push({
+          success: true,
+          responseTime,
+          timestamp: Date.now(),
+          content: fullContent.substring(0, 100),
+        })
+
+        updateMetrics(metricsState, startTime)
+      } catch (error: any) {
+        if (error.name === "AbortError") return
+
+        const responseTime = Date.now() - requestStartTime
+        metricsState.completed++
+        metricsState.failed++
+        metricsState.requests.push({
+          success: false,
+          responseTime,
+          timestamp: Date.now(),
+          error: error.message,
+        })
+
+        updateMetrics(metricsState, startTime)
       }
-    } catch (error) {
+    }
+
+    const updateMetrics = (state: any, startTime: number) => {
+      const totalTime = state.requests.reduce((sum: number, req: any) => sum + req.responseTime, 0)
+      state.avgResponseTime = state.requests.length > 0 ? Math.round(totalTime / state.requests.length) : 0
+
+      const elapsedMinutes = (Date.now() - startTime) / 60000
+      state.rpm = elapsedMinutes > 0 ? state.completed / elapsedMinutes : 0
+
+      setMetrics({ ...state })
+    }
+
+    const executeWithConcurrency = async () => {
+      const queue = Array.from({ length: totalRequests }, (_, i) => i)
+      const executing: Promise<void>[] = []
+
+      for (const index of queue) {
+        const promise = makeRequest(index)
+        executing.push(promise)
+
+        if (executing.length >= maxConcurrency) {
+          await Promise.race(executing)
+          executing.splice(
+            executing.findIndex((p) => p === promise),
+            1,
+          )
+        }
+      }
+
+      await Promise.all(executing)
+    }
+
+    try {
+      await executeWithConcurrency()
       toast({
-        title: "Error",
-        description: "Stress test failed",
-        variant: "destructive",
+        title: "Test Complete",
+        description: `Completed ${metricsState.successful} successful requests`,
       })
+    } catch (error) {
+      console.error("Test error:", error)
     } finally {
       setIsRunning(false)
+      setAbortController(null)
     }
   }
 
   const stopTest = () => {
+    if (abortController) {
+      abortController.abort()
+      setAbortController(null)
+    }
     setIsRunning(false)
+    toast({
+      title: "Test Stopped",
+      description: "Stress test has been stopped",
+    })
   }
 
   return (
